@@ -1,73 +1,43 @@
 # Applying the Patch
 
-## Prerequisites
-
-- Linux x64 system
-- Depot tools installed (`fetch v8` workflow)
-- Build dependencies met
-
-## Step-by-Step
-
-### 1. Get V8 Source
+## Quick Start
 
 ```bash
-mkdir v8-work && cd v8-work
-fetch v8
+# Clone V8 source
+git clone https://chromium.googlesource.com/v8/v8
 cd v8
-gclient sync
+
+# Apply the patch
+git apply patches/v2-full-patch.patch
+
+# Build with sandbox enabled
+tools/dev/gm.py x64.release d8
+
+# Test with --sandbox-testing
+./out/x64.release/d8 --sandbox-testing escape_dv.js
+./out/x64.release/d8 --sandbox-testing escape_wasm.js
 ```
 
-### 2. Apply the Patch
+## Patch Files
 
-```bash
-git apply patches/0001-validate-sandboxed-ptr-bounded-size-boundary.patch
-```
+- `v2-full-patch.patch` — Complete patch including v1 defense-in-depth and v2
+  primary fix.  Apply to a clean V8 checkout.
+- `v2-sandbox-pointer-bounds-check.patch` — v2 changes only (on top of v1).
 
-If the patch does not apply cleanly (due to upstream changes), you can
-apply the changes manually using the annotated diff in PATCH_DIFF.md.
+## Expected Behavior
 
-### 3. Build V8 with Sandbox Enabled
+On the **unpatched** build, both PoCs demonstrate sandbox escape:
+- `escape_dv.js`: DataView data_pointer_ + raw_byte_length_ corruption → ~2GB OOB
+- `escape_wasm.js`: ArrayBuffer backing_store_ + raw_byte_length_ corruption → ~2GB OOB
 
-```bash
-tools/dev/gm.py x64.sandbox
-```
+On the **patched** build (v2):
+- Both PoCs should trigger a sandbox violation check and crash (ud2/SIGILL)
+  instead of completing the escape.
+- The crash occurs at the first data pointer access that violates the
+  `data_pointer + byte_length <= sandbox_end` invariant.
 
-Or manually:
+## Build Configuration
 
-```bash
-gn gen out/x64.sandbox --args='
-  is_debug = false
-  v8_enable_sandbox = true
-  v8_enable_memory_corruption_api = true
-'
-ninja -C out/x64.sandbox d8
-```
-
-### 4. Verify the Fix
-
-Run the DataView PoC against the patched build:
-
-```bash
-./out/x64.sandbox/d8 --sandbox-testing escape_dv.js
-```
-
-Expected behavior on patched build: the process aborts with a CHECK
-failure (SBXCHECK fires when base + byte_length exceeds sandbox_end),
-instead of printing the escape confirmation.
-
-Run the Wasm PoC:
-
-```bash
-./out/x64.sandbox/d8 --sandbox-testing escape_wasm.js
-```
-
-Same expectation: SBXCHECK fires, process aborts, no escape.
-
-### 5. Verify No Regression
-
-Run V8's existing test suite to confirm the patch does not break
-legitimate functionality:
-
-```bash
-tools/run-tests.py --outdir=out/x64.sandbox
-```
+The patch requires:
+- `v8_enable_sandbox = true` (default in recent V8)
+- `v8_enable_memory_corruption_api = true` (for --sandbox-testing)

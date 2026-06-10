@@ -1,0 +1,313 @@
+diff --git a/src/builtins/data-view.tq b/src/builtins/data-view.tq
+index 4293aed6..dbd1ce60 100644
+--- a/src/builtins/data-view.tq
++++ b/src/builtins/data-view.tq
+@@ -146,6 +146,8 @@ extern macro Float64ExtractLowWord32(float64): uint32;
+ extern macro Float64ExtractHighWord32(float64): uint32;
+ extern macro Float64InsertLowWord32(float64, uint32): float64;
+ extern macro Float64InsertHighWord32(float64, uint32): float64;
++extern macro ValidateJSDataViewDataPointerBounds(
++    JSDataViewOrRabGsabDataView): void;
+ 
+ extern macro DataViewBuiltinsAssembler::LoadUint8(RawPtr, uintptr): uint32;
+ extern macro DataViewBuiltinsAssembler::LoadInt8(RawPtr, uintptr): int32;
+@@ -440,6 +442,8 @@ transitioning macro DataViewGet(
+           MakeDataViewGetterNameString(kind));
+     } label NotDetachedNorOutOfBounds {}
+ 
++    ValidateJSDataViewDataPointerBounds(dataView);
++
+     // 8. Let viewOffset be view.[[ByteOffset]].
+     const viewOffset: uintptr = dataView.byte_offset;
+ 
+@@ -772,6 +776,8 @@ transitioning macro DataViewSet(
+           MakeDataViewSetterNameString(kind));
+     } label NotDetachedNorOutOfBounds {}
+ 
++    ValidateJSDataViewDataPointerBounds(dataView);
++
+     // 11. Let viewOffset be view.[[ByteOffset]].
+     const viewOffset: uintptr = dataView.byte_offset;
+ 
+diff --git a/src/codegen/code-stub-assembler.cc b/src/codegen/code-stub-assembler.cc
+index a7e2a67e..71b130e2 100644
+--- a/src/codegen/code-stub-assembler.cc
++++ b/src/codegen/code-stub-assembler.cc
+@@ -18650,8 +18650,70 @@ TNode<UintPtrT> CodeStubAssembler::LoadJSArrayBufferMaxByteLength(
+ 
+ TNode<RawPtrT> CodeStubAssembler::LoadJSArrayBufferBackingStorePtr(
+     TNode<JSArrayBuffer> array_buffer) {
+-  return LoadSandboxedPointerFromObject(
++  TNode<RawPtrT> backing_store = LoadSandboxedPointerFromObject(
+       array_buffer, offsetof(JSArrayBuffer, backing_store_));
++#ifdef V8_ENABLE_SANDBOX
++  // The SandboxedPtr encoding guarantees the decoded base is inside the
++  // sandbox.  However, the Torque/CSA DataView and TypedArray access paths
++  // compute base + offset and check only offset < byte_length, without
++  // verifying that base + offset stays within the sandbox.  If both
++  // backing_store_ and raw_byte_length_ are corrupted (the sandbox threat
++  // model assumes arbitrary in-sandbox writes), base + offset can escape.
++  // Validate the invariant here so that any subsequent base + offset access
++  // that passed the byte_length check is guaranteed to stay in bounds.
++  TNode<UintPtrT> byte_length = LoadJSArrayBufferByteLength(array_buffer);
++  TNode<ExternalReference> sandbox_end_address =
++      ExternalConstant(ExternalReference::sandbox_end_address());
++  TNode<UintPtrT> sandbox_end = Load<UintPtrT>(sandbox_end_address);
++  TNode<UintPtrT> effective_end = UintPtrAdd(
++      ReinterpretCast<UintPtrT>(backing_store), byte_length);
++  CSA_CHECK(this, UintPtrLessThanOrEqual(effective_end, sandbox_end));
++#endif  // V8_ENABLE_SANDBOX
++  return backing_store;
++}
++
++TNode<RawPtrT> CodeStubAssembler::LoadJSTypedArrayExternalPointerPtr(
++    TNode<JSTypedArray> holder) {
++  TNode<RawPtrT> external_pointer = LoadSandboxedPointerFromObject(
++      holder, offsetof(JSTypedArray, external_pointer_));
++#ifdef V8_ENABLE_SANDBOX
++  // Same invariant as LoadJSArrayBufferBackingStorePtr: the SandboxedPtr
++  // encoding guarantees the decoded base is inside the sandbox, but
++  // base + byte_length can exceed sandbox_end when both external_pointer_
++  // and raw_byte_length_ are corrupted.  Validate here so that any
++  // subsequent base + offset access that passed the byte_length check is
++  // guaranteed to stay in bounds.
++  TNode<UintPtrT> byte_length = LoadBoundedSizeFromObject(
++      holder, offsetof(JSTypedArray, raw_byte_length_));
++  TNode<ExternalReference> sandbox_end_address =
++      ExternalConstant(ExternalReference::sandbox_end_address());
++  TNode<UintPtrT> sandbox_end = Load<UintPtrT>(sandbox_end_address);
++  TNode<UintPtrT> effective_end = UintPtrAdd(
++      ReinterpretCast<UintPtrT>(external_pointer), byte_length);
++  CSA_CHECK(this, UintPtrLessThanOrEqual(effective_end, sandbox_end));
++#endif  // V8_ENABLE_SANDBOX
++  return external_pointer;
++}
++
++void CodeStubAssembler::ValidateJSDataViewDataPointerBounds(
++    TNode<JSDataViewOrRabGsabDataView> data_view) {
++#ifdef V8_ENABLE_SANDBOX
++  // Defense in depth: validate that the DataView's data_pointer_ +
++  // byte_length does not exceed the sandbox boundary, even though the
++  // DataView builtins access data through buffer.backing_store_ptr.
++  // This detects corruption of data_pointer_ or raw_byte_length_ that
++  // could be exploited through other code paths (e.g. Maglev inlining).
++  TNode<RawPtrT> data_pointer = LoadSandboxedPointerFromObject(
++      data_view, offsetof(JSDataViewOrRabGsabDataView, data_pointer_));
++  TNode<UintPtrT> byte_length = LoadBoundedSizeFromObject(
++      data_view, offsetof(JSDataViewOrRabGsabDataView, raw_byte_length_));
++  TNode<ExternalReference> sandbox_end_address =
++      ExternalConstant(ExternalReference::sandbox_end_address());
++  TNode<UintPtrT> sandbox_end = Load<UintPtrT>(sandbox_end_address);
++  TNode<UintPtrT> effective_end = UintPtrAdd(
++      ReinterpretCast<UintPtrT>(data_pointer), byte_length);
++  CSA_CHECK(this, UintPtrLessThanOrEqual(effective_end, sandbox_end));
++#endif  // V8_ENABLE_SANDBOX
+ }
+ 
+ TNode<JSArrayBuffer> CodeStubAssembler::LoadJSArrayBufferViewBuffer(
+diff --git a/src/codegen/code-stub-assembler.h b/src/codegen/code-stub-assembler.h
+index 67cfb409..243ecf81 100644
+--- a/src/codegen/code-stub-assembler.h
++++ b/src/codegen/code-stub-assembler.h
+@@ -1147,10 +1147,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
+ #endif  // V8_ENABLE_WEBASSEMBLY
+ 
+   TNode<RawPtrT> LoadJSTypedArrayExternalPointerPtr(
+-      TNode<JSTypedArray> holder) {
+-    return LoadSandboxedPointerFromObject(
+-        holder, offsetof(JSTypedArray, external_pointer_));
+-  }
++      TNode<JSTypedArray> holder);
+ 
+   void StoreJSTypedArrayExternalPointerPtr(TNode<JSTypedArray> holder,
+                                            TNode<RawPtrT> value) {
+@@ -4339,6 +4336,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
+   void StoreJSArrayBufferViewByteOffset(
+       TNode<JSArrayBufferView> array_buffer_view, TNode<UintPtrT> value);
+ 
++  void ValidateJSDataViewDataPointerBounds(
++      TNode<JSDataViewOrRabGsabDataView> data_view);
++
+   TNode<UintPtrT> LoadJSTypedArrayLength(
+       TNode<JSTypedArray> typed_array,
+       std::optional<TNode<Int32T>> elements_kind = std::nullopt);
+diff --git a/src/codegen/x64/macro-assembler-x64.cc b/src/codegen/x64/macro-assembler-x64.cc
+index 78317a06..fe46ff83 100644
+--- a/src/codegen/x64/macro-assembler-x64.cc
++++ b/src/codegen/x64/macro-assembler-x64.cc
+@@ -702,6 +702,28 @@ void MacroAssembler::LoadSandboxedPointerField(Register destination,
+   DecodeSandboxedPointer(destination);
+ }
+ 
++void MacroAssembler::SandboxedPointerBoundsCheck(Register decoded_pointer,
++                                                  Register byte_length) {
++  ASM_CODE_COMMENT(this);
++#ifdef V8_ENABLE_SANDBOX
++  DCHECK_NE(decoded_pointer, kScratchRegister);
++  DCHECK_NE(byte_length, kScratchRegister);
++  Label ok(this);
++  // Load sandbox_end
++  movq(kScratchRegister, ExternalReference::sandbox_end_address());
++  movq(kScratchRegister, Operand(kScratchRegister, 0));
++  // Check: decoded_pointer + byte_length <= sandbox_end
++  // Equivalently: byte_length <= sandbox_end - decoded_pointer
++  // The SandboxedPtr encoding guarantees decoded_pointer <= sandbox_end,
++  // so sandbox_end - decoded_pointer is non-negative.
++  subq(kScratchRegister, decoded_pointer);
++  cmpq(byte_length, kScratchRegister);
++  j(below_or_equal, &ok);
++  ud2();
++  bind(&ok);
++#endif  // V8_ENABLE_SANDBOX
++}
++
+ void MacroAssembler::StoreSandboxedPointerField(Operand dst_field_operand,
+                                                 Register value) {
+   ASM_CODE_COMMENT(this);
+diff --git a/src/codegen/x64/macro-assembler-x64.h b/src/codegen/x64/macro-assembler-x64.h
+index c8844910..da9f21eb 100644
+--- a/src/codegen/x64/macro-assembler-x64.h
++++ b/src/codegen/x64/macro-assembler-x64.h
+@@ -844,6 +844,10 @@ class V8_EXPORT_PRIVATE MacroAssembler
+   // Encode and store a SandboxedPointer to the heap.
+   void StoreSandboxedPointerField(Operand dst_field_operand, Register value);
+ 
++  // Validate that decoded_pointer + byte_length does not exceed the sandbox
++  // boundary.  Both registers must differ from kScratchRegister.
++  void SandboxedPointerBoundsCheck(Register decoded_pointer, Register byte_length);
++
+   enum class IsolateRootLocation { kInScratchRegister, kInRootRegister };
+   // Loads a field containing off-heap pointer and does necessary decoding
+   // if sandboxed external pointers are enabled.
+diff --git a/src/maglev/maglev-ir.cc b/src/maglev/maglev-ir.cc
+index 9f0723a2..fe8b3c2e 100644
+--- a/src/maglev/maglev-ir.cc
++++ b/src/maglev/maglev-ir.cc
+@@ -7952,6 +7952,19 @@ void LoadDataViewDataPointer::GenerateCode(MaglevAssembler* masm,
+       return_value,
+       FieldMemOperand(object,
+                       offsetof(JSDataViewOrRabGsabDataView, data_pointer_)));
++#ifdef V8_ENABLE_SANDBOX
++  // Validate that data_pointer + byte_length does not exceed the sandbox
++  // boundary.  The SandboxedPtr encoding guarantees the decoded base is
++  // within the sandbox, but base + byte_length can exceed sandbox_end when
++  // both data_pointer_ (SandboxedPtr) and raw_byte_length_ (BoundedSize)
++  // are corrupted.  Without this check, base + user_offset can escape the
++  // sandbox even though each field individually appears valid.
++  Register scratch = kScratchRegister;
++  __ LoadBoundedSizeFromObject(
++      scratch, object,
++      offsetof(JSDataViewOrRabGsabDataView, raw_byte_length_));
++  __ SandboxedPointerBoundsCheck(return_value, scratch);
++#endif  // V8_ENABLE_SANDBOX
+ }
+ 
+ // ---
+diff --git a/src/maglev/x64/maglev-assembler-x64-inl.h b/src/maglev/x64/maglev-assembler-x64-inl.h
+index 7e17731b..25860175 100644
+--- a/src/maglev/x64/maglev-assembler-x64-inl.h
++++ b/src/maglev/x64/maglev-assembler-x64-inl.h
+@@ -335,6 +335,18 @@ inline void MaglevAssembler::BuildTypedArrayDataPointer(Register data_pointer,
+   LoadExternalPointerField(
+       data_pointer,
+       FieldOperand(object, offsetof(JSTypedArray, external_pointer_)));
++#ifdef V8_ENABLE_SANDBOX
++  // Validate that external_pointer + byte_length does not exceed the sandbox
++  // boundary.  For off-heap typed arrays (base_pointer == Smi::zero),
++  // external_pointer is the full data address and this check prevents sandbox
++  // escape when both external_pointer_ (SandboxedPtr) and raw_byte_length_
++  // (BoundedSize) are corrupted.  For on-heap typed arrays the data resides
++  // within the V8 heap (sandbox-contained), so this check is defense in depth.
++  Register scratch = kScratchRegister;
++  LoadBoundedSizeFromObject(scratch, object,
++                            offsetof(JSTypedArray, raw_byte_length_));
++  SandboxedPointerBoundsCheck(data_pointer, scratch);
++#endif  // V8_ENABLE_SANDBOX
+   if (JSTypedArray::kMaxSizeInHeap == 0) return;
+ 
+   Register base = kScratchRegister;
+diff --git a/src/objects/js-array-buffer-inl.h b/src/objects/js-array-buffer-inl.h
+index 46f4af88..1e45f108 100644
+--- a/src/objects/js-array-buffer-inl.h
++++ b/src/objects/js-array-buffer-inl.h
+@@ -63,6 +63,16 @@ void* JSArrayBuffer::backing_store() const {
+ void* JSArrayBuffer::backing_store(PtrComprCageBase cage_base) const {
+   Address value = ReadSandboxedPointerField(
+       offsetof(JSArrayBuffer, backing_store_), cage_base);
++#ifdef V8_ENABLE_SANDBOX
++  // The sandbox threat model assumes an attacker can corrupt in-sandbox data
++  // arbitrarily.  If both backing_store_ (SandboxedPtr) and raw_byte_length_
++  // (BoundedSize) are corrupted, the decoded base pointer is still inside the
++  // sandbox, but base + byte_length can exceed sandbox_end.  Subsequent
++  // memory accesses that only check offset < byte_length will then read or
++  // write past the sandbox boundary.  Validate the combined invariant here.
++  size_t length = byte_length_unchecked();
++  SBXCHECK(value + length <= Sandbox::current()->end());
++#endif  // V8_ENABLE_SANDBOX
+   return reinterpret_cast<void*>(value);
+ }
+ 
+@@ -402,8 +412,20 @@ Address JSTypedArray::external_pointer() const {
+ }
+ 
+ Address JSTypedArray::external_pointer(PtrComprCageBase cage_base) const {
+-  return ReadSandboxedPointerField(offsetof(JSTypedArray, external_pointer_),
++  Address value = ReadSandboxedPointerField(offsetof(JSTypedArray, external_pointer_),
+                                    cage_base);
++#ifdef V8_ENABLE_SANDBOX
++  // For off-heap typed arrays (base_pointer == Smi::zero), external_pointer_
++  // is the sole data pointer.  Validate that it plus the byte length does not
++  // escape the sandbox, consistent with the checks on backing_store and
++  // data_pointer.  On-heap typed arrays store data inside the V8 heap, which
++  // is sandbox-contained, so the check is only relevant for the off-heap case.
++  if (!is_on_heap()) {
++    size_t length = byte_length();
++    SBXCHECK(value + length <= Sandbox::current()->end());
++  }
++#endif  // V8_ENABLE_SANDBOX
++  return value;
+ }
+ 
+ void JSTypedArray::set_external_pointer(Isolate* isolate, Address value) {
+@@ -588,6 +610,15 @@ void* JSDataViewOrRabGsabDataView::data_pointer(
+     PtrComprCageBase cage_base) const {
+   Address value = ReadSandboxedPointerField(
+       offsetof(JSDataViewOrRabGsabDataView, data_pointer_), cage_base);
++#ifdef V8_ENABLE_SANDBOX
++  // Same invariant as JSArrayBuffer::backing_store: data_pointer +
++  // byte_length must not exceed the sandbox boundary.  Without this check,
++  // corrupting both data_pointer_ (SandboxedPtr) and raw_byte_length_
++  // (BoundedSize) allows base + offset to escape the sandbox even though
++  // each field individually appears valid.
++  size_t length = byte_length();
++  SBXCHECK(value + length <= Sandbox::current()->end());
++#endif  // V8_ENABLE_SANDBOX
+   return reinterpret_cast<void*>(value);
+ }
+ 
+diff --git a/src/sandbox/sandboxed-pointer-inl.h b/src/sandbox/sandboxed-pointer-inl.h
+index cd5c0d8b..f92fa5e6 100644
+--- a/src/sandbox/sandboxed-pointer-inl.h
++++ b/src/sandbox/sandboxed-pointer-inl.h
+@@ -10,6 +10,7 @@
+ 
+ #include "include/v8-internal.h"
+ #include "src/common/ptr-compr-inl.h"
++#include "src/sandbox/check.h"
+ #include "src/sandbox/sandbox.h"
+ 
+ namespace v8 {
+@@ -23,6 +24,13 @@ V8_INLINE Address ReadSandboxedPointerField(Address field_address,
+ 
+   Address offset = sandboxed_pointer >> kSandboxedPointerShift;
+   Address pointer = cage_base.address() + offset;
++  // The SandboxedPtr encoding guarantees the decoded pointer falls within
++  // the sandbox by construction.  Verify this invariant as defense in depth:
++  // if in-sandbox data has been corrupted, the decoded base could still lie
++  // inside the sandbox, but subsequent pointer arithmetic (base + offset)
++  // might escape it.  The per-field SBXCHECK in the data-pointer accessors
++  // (backing_store, data_pointer, external_pointer) catches that case.
++  SBXCHECK(Sandbox::current()->Contains(pointer));
+   return pointer;
+ #else
+   return ReadMaybeUnalignedValue<Address>(field_address);
